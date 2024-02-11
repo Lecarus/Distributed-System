@@ -23,11 +23,7 @@ const (
 )
 
 const (
-	TickInterval         int64   = 30
-	HeartbeatInterval    int64   = 100
-	BaseHeartbeatTimeout int64   = 300
-	BaseElectionTimeout  int64   = 1000
-	RandomFactor         float64 = 0.8
+	HEART_BEAT_TIMEOUT = 100
 )
 
 type LogEntry struct {
@@ -84,8 +80,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	state         RaftState
-	heartbeatTime time.Time
-	electionTime  time.Time
+	lastHeartbeat time.Time // the timestamp of the last heartbeat message
 
 	// Persistent state on all servers
 	currentTerm int        // latest term server has seen
@@ -102,11 +97,11 @@ type Raft struct {
 	matchIndex []int // for each server, index of highest log entry known to be replicated on server
 
 	// Snapshot state on all servers
-	lastIncludedIndex int    // the snapshot replaces all entries up through and including this index, entire log up to the index discarded
+	lastIncludedIndex int    // 快照（snapshot）替换了所有该索引及之前的日志条目，整个日志直到这个索引都会被丢弃。在恢复时，系统将从该索引处开始重新应用日志。
 	lastIncludedTerm  int    // term of lastIncludedIndex
-	snapshot          []byte // snapshot stored in memory
+	snapshot          []byte // 被压缩后的快照信息
 
-	// Temporary location to give the service snapshot to the apply thread
+	// 临时位置，用于将快照snapshot传递给应用线程
 	// All apply messages should be sent in one go routine, we need the temporary space for applyLogsLoop to handle the snapshot apply
 	waitingIndex    int    // lastIncludedIndex to be sent to applyCh
 	waitingTerm     int    // lastIncludedTerm to be sent to applyCh
@@ -264,22 +259,22 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) ticker() {
 	for !rf.killed() {
-
+		electionTimeout := time.Duration(HEART_BEAT_TIMEOUT*2+rand.Intn(HEART_BEAT_TIMEOUT)) * time.Millisecond
 		rf.mu.Lock()
 		// If election timeout elapses: start new election
-		if time.Now().After(rf.electionTime) {
+		if rf.state != Leader && time.Since(rf.lastHeartbeat) >= electionTimeout {
 			Debug(dTimer, "S%d ELT elapsed. Converting to Candidate, calling election.", rf.me)
 			rf.startElection()
 		}
 		// leader repeat heartbeat during idle periods to prevent election timeouts (§5.2)
-		if rf.state == Leader && time.Now().After(rf.heartbeatTime) {
+		if rf.state == Leader {
 			Debug(dTimer, "S%d HBT elapsed. Broadcast heartbeats.", rf.me)
 			rf.sendEntries(true)
 		}
 		rf.mu.Unlock()
 		//如果没有这个休眠操作，这个 goroutine 就会立即进入下一次循环，导致任务过于频繁
 		//你需要编写定时执行或延迟一段时间后执行某些操作的代码。最简单的方法是创建一个带有循环的 goroutine，并在循环中调用 time.Sleep()
-		time.Sleep(time.Duration(TickInterval) * time.Millisecond)
+		time.Sleep(time.Duration(HEART_BEAT_TIMEOUT) * time.Millisecond)
 	}
 }
 
@@ -294,7 +289,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.state = Follower
-	rf.setElectionTimeout(randHeartbeatTimeout())
+	rf.lastHeartbeat = time.Now()
 	rf.log = make([]LogEntry, 0)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
@@ -330,7 +325,9 @@ func (rf *Raft) applyLogsLoop() {
 		// use a slice to store all committed messages to apply, and apply them only after unlocked
 		var appliedMsgs []ApplyMsg
 		rf.lastApplied = max(rf.lastApplied, rf.lastIncludedIndex)
-
+		//检查是否存在等待应用的快照:如果不为nil，说明有快照snapshot要被提交
+		//如果存在等待应用的快照，则将其应用；
+		//否则，依次应用从 rf.lastApplied 到 rf.commitIndex 之间的所有日志
 		if rf.waitingSnapshot != nil {
 			appliedMsgs = append(appliedMsgs, ApplyMsg{
 				SnapshotValid: true,
@@ -354,30 +351,8 @@ func (rf *Raft) applyLogsLoop() {
 		for _, msg := range appliedMsgs {
 			rf.applyCh <- msg
 		}
-		time.Sleep(time.Duration(TickInterval) * time.Millisecond)
+		time.Sleep(time.Duration(HEART_BEAT_TIMEOUT) * time.Millisecond)
 	}
-}
-
-func randElectionTimeout() time.Duration {
-	extraTime := int64(float64(rand.Int63()%BaseElectionTimeout) * RandomFactor)
-	return time.Duration(extraTime+BaseElectionTimeout) * time.Millisecond
-}
-
-func randHeartbeatTimeout() time.Duration {
-	extraTime := int64(float64(rand.Int63()%BaseHeartbeatTimeout) * RandomFactor)
-	return time.Duration(extraTime+BaseHeartbeatTimeout) * time.Millisecond
-}
-
-func (rf *Raft) setElectionTimeout(timeout time.Duration) {
-	t := time.Now()
-	t = t.Add(timeout)
-	rf.electionTime = t
-}
-
-func (rf *Raft) setHeartbeatTimeout(timeout time.Duration) {
-	t := time.Now()
-	t = t.Add(timeout)
-	rf.heartbeatTime = t
 }
 
 /*====================选举流程=====================================*/
@@ -386,7 +361,7 @@ func (rf *Raft) startElection() {
 	rf.currentTerm++    // Increment currentTerm
 	rf.votedFor = rf.me // Vote for self
 	rf.persist()
-	rf.setElectionTimeout(randElectionTimeout()) // Reset election timer
+	rf.lastHeartbeat = time.Now()
 	Debug(dTimer, "S%d Resetting ELT because of election, wait for next potential election timeout.", rf.me)
 	lastLogIndex, lastLogTerm := rf.lastLogInfo()
 	args := &RequestVoteArgs{
@@ -473,7 +448,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		rf.persist()
 		Debug(dTimer, "S%d Resetting ELT, wait for next potential election timeout.", rf.me)
-		rf.setElectionTimeout(randElectionTimeout())
+		rf.lastHeartbeat = time.Now()
 	}
 }
 
@@ -492,10 +467,6 @@ func (rf *Raft) checkTerm(term int) bool {
 
 /*====================心跳流程=========================================*/
 func (rf *Raft) sendEntries(isHeartbeat bool) {
-	Debug(dTimer, "S%d Resetting HBT, wait for next heartbeat broadcast.", rf.me)
-	rf.setHeartbeatTimeout(time.Duration(HeartbeatInterval) * time.Millisecond)
-	Debug(dTimer, "S%d Resetting ELT, wait for next potential heartbeat timeout.", rf.me)
-	rf.setElectionTimeout(randHeartbeatTimeout())
 	lastLogIndex, _ := rf.lastLogInfo()
 	for peer := range rf.peers {
 		if peer == rf.me {
@@ -641,8 +612,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.checkTerm(args.Term)
 	reply.Term = rf.currentTerm
-	Debug(dTimer, "S%d Resetting ELT, wait for next potential heartbeat timeout.", rf.me)
-	rf.setElectionTimeout(randHeartbeatTimeout())
+	rf.lastHeartbeat = time.Now()
 
 	if args.PrevLogIndex < rf.lastIncludedIndex {
 		alreadySnapshotLogLen := rf.lastIncludedIndex - args.PrevLogIndex
@@ -698,23 +668,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 }
 
-// Get the entry with the given index.
-// Index and term of *valid* entries start from 1.
-// If no *valid* entry is found, return an empty entry with term equal to -1.
-// If log is too short, also return an empty entry with term equal to -1.
-// Panic if the index of the log entry is already in the snapshot and unable to get from memory.
 func (rf *Raft) getEntry(index int) *LogEntry {
 	logEntries := rf.log
+	//假设logEntries==[1,2,3,4,5],lastIncludedIndex==3,index==4,那么logIndex==1
 	logIndex := index - rf.lastIncludedIndex
 	if logIndex < 0 {
 		log.Panicf("LogEntries.getEntry: index too small. (%d < %d)", index, rf.lastIncludedIndex)
 	}
+	//如果给定的索引刚好是最后被快照的日志条目的下标索引,那么任期也应该是最后被快照的日志条目的下标任期
 	if logIndex == 0 {
 		return &LogEntry{
 			Command: nil,
 			Term:    rf.lastIncludedTerm,
 		}
 	}
+	//// 如果计算得到的索引超过当前节点日志的长度，返回一个特殊标志，表示没有对应的日志条目
 	if logIndex > len(logEntries) {
 		return &LogEntry{
 			Command: nil,
@@ -728,13 +696,13 @@ func (rf *Raft) getEntry(index int) *LogEntry {
 // Return (0, 0) if the log is empty.
 func (rf *Raft) lastLogInfo() (index, term int) {
 	logEntries := rf.log
+	//假设logEntries==[1,2,3,4,5],lastIncludedIndex==3,那么有效logEntries==[4,5],则len(logEntries)==2
 	index = len(logEntries) + rf.lastIncludedIndex
 	logEntry := rf.getEntry(index)
 	return index, logEntry.Term
 }
 
 // Get the slice of the log with index from startIndex to endIndex.
-// startIndex included and endIndex excluded, therefore startIndex should be no greater than endIndex.
 func (rf *Raft) getSlice(startIndex, endIndex int) []LogEntry {
 	logEntries := rf.log
 	logStartIndex := startIndex - rf.lastIncludedIndex
@@ -854,7 +822,6 @@ func (rf *Raft) readPersist(data []byte) {
 // where they can later be retrieved after a crash and restart.
 func (rf *Raft) persistAndSnapshot(snapshot []byte) {
 	Debug(dSnap, "S%d Saving persistent state and service snapshot to stable storage at T%d.", rf.me, rf.currentTerm)
-	// Your code here (2C).
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	if err := e.Encode(rf.currentTerm); err != nil {
@@ -902,30 +869,33 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	return true
 }
 
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
+// Raft 协议当前状态机已经应用了多少条日志，然后它打算进行一轮快照（snapshot）来压缩日志
+// 参数：预期截断的下标，以及被压缩后的快照信息
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	Debug(dSnap, "S%d Snapshotting through index %d.", rf.me, index)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	lastLogIndex, _ := rf.lastLogInfo()
+	//当前节点已经应用了一个包含传入索引的快照，无需再次进行快照
 	if rf.lastIncludedIndex >= index {
 		Debug(dSnap, "S%d Snapshot already applied to persistent storage. (%d >= %d)", rf.me, rf.lastIncludedIndex, index)
 		return
 	}
+	//在 index 之前的日志还未提交，不能安全地截断这些未提交的日志
 	if rf.commitIndex < index {
 		Debug(dWarn, "S%d Cannot snapshot uncommitted log entries, discard the call. (%d < %d)", rf.me, rf.commitIndex, index)
 		return
 	}
-	newLog := rf.getSlice(index+1, lastLogIndex+1)
+	newLog := rf.getSlice(index+1, lastLogIndex+1) //slice是左闭右开
 	newLastIncludeTerm := rf.getEntry(index).Term
 
+	// 更新 Raft 节点的相关状态
 	rf.lastIncludedTerm = newLastIncludeTerm
 	rf.log = newLog
 	rf.lastIncludedIndex = index
 	rf.snapshot = snapshot
+
+	// 持久化快照信息
 	rf.persistAndSnapshot(snapshot)
 
 }
@@ -976,6 +946,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	defer rf.mu.Unlock()
 	Debug(dSnap, "S%d <- S%d Received install snapshot request at T%d.", rf.me, args.LeaderId, rf.currentTerm)
 
+	//1.Reply immediately if term < currentTerm
 	if args.Term < rf.currentTerm {
 		Debug(dSnap, "S%d Term is lower, rejecting install snapshot request. (%d < %d)", rf.me, args.Term, rf.currentTerm)
 		reply.Term = rf.currentTerm
@@ -985,10 +956,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	reply.Term = rf.currentTerm
 
 	Debug(dTimer, "S%d Resetting ELT, wait for next potential heartbeat timeout.", rf.me)
-	rf.setElectionTimeout(randHeartbeatTimeout())
+	rf.lastHeartbeat = time.Now()
 
-	// All apply messages should be sent in one go routine (applyLogsLoop),
-	// otherwise the apply action could be out of order, where the snapshot apply could cut in line when the command apply is running.
+	// 所有的应用消息都应该在一个单独的 goroutine 中发送（applyLogsLoop 函数），
+	// 否则可能导致应用动作出现乱序，其中快照应用可能在命令应用正在运行时插队。
 	if rf.waitingIndex >= args.LastIncludedIndex {
 		Debug(dSnap, "S%d A newer snapshot already exists, rejecting install snapshot request. (%d <= %d)",
 			rf.me, args.LastIncludedIndex, rf.waitingIndex)

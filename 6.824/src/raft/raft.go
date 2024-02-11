@@ -23,7 +23,8 @@ const (
 )
 
 const (
-	HEART_BEAT_TIMEOUT = 100
+	TickInterval       int64 = 30
+	HEART_BEAT_TIMEOUT       = 100
 )
 
 type LogEntry struct {
@@ -257,7 +258,7 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) ticker() {
+func (rf *Raft) electionLoop() {
 	for !rf.killed() {
 		electionTimeout := time.Duration(HEART_BEAT_TIMEOUT*2+rand.Intn(HEART_BEAT_TIMEOUT)) * time.Millisecond
 		rf.mu.Lock()
@@ -266,15 +267,21 @@ func (rf *Raft) ticker() {
 			Debug(dTimer, "S%d ELT elapsed. Converting to Candidate, calling election.", rf.me)
 			rf.startElection()
 		}
-		// leader repeat heartbeat during idle periods to prevent election timeouts (§5.2)
-		if rf.state == Leader {
-			Debug(dTimer, "S%d HBT elapsed. Broadcast heartbeats.", rf.me)
-			rf.sendEntries(true)
-		}
 		rf.mu.Unlock()
 		//如果没有这个休眠操作，这个 goroutine 就会立即进入下一次循环，导致任务过于频繁
 		//你需要编写定时执行或延迟一段时间后执行某些操作的代码。最简单的方法是创建一个带有循环的 goroutine，并在循环中调用 time.Sleep()
-		time.Sleep(time.Duration(HEART_BEAT_TIMEOUT) * time.Millisecond)
+		time.Sleep(time.Duration(TickInterval) * time.Millisecond)
+	}
+}
+
+func (rf *Raft) heartbeatLoop() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.state == Leader {
+			rf.sendEntries(true)
+		}
+		rf.mu.Unlock()
+		time.Sleep(HEART_BEAT_TIMEOUT * time.Millisecond)
 	}
 }
 
@@ -308,7 +315,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	lastLogIndex, lastLogTerm := rf.lastLogInfo()
 	Debug(dClient, "S%d Started at T%d. LLI: %d, LLT: %d.", rf.me, rf.currentTerm, lastLogIndex, lastLogTerm)
 	// start ticker goroutine to start elections
-	go rf.ticker()
+	go rf.electionLoop()
+	go rf.heartbeatLoop()
 
 	// Apply logs periodically until the last committed index to make sure state machine is up to date.
 	go rf.applyLogsLoop()
@@ -361,7 +369,7 @@ func (rf *Raft) startElection() {
 	rf.currentTerm++    // Increment currentTerm
 	rf.votedFor = rf.me // Vote for self
 	rf.persist()
-	rf.lastHeartbeat = time.Now()
+	rf.lastHeartbeat = time.Now() // Reset election timer
 	Debug(dTimer, "S%d Resetting ELT because of election, wait for next potential election timeout.", rf.me)
 	lastLogIndex, lastLogTerm := rf.lastLogInfo()
 	args := &RequestVoteArgs{
